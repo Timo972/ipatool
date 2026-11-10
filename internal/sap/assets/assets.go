@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -89,20 +90,41 @@ func Load(ctx context.Context) (Bundle, error) {
 		return Bundle{}, err
 	}
 
-	if bundle, err := readCache(directory); err == nil {
-		return bundle, nil
+	// Every signed Store request loads the assets. Keep the verified bundle
+	// in memory instead of reading and hashing about 175 MB again each time.
+	// Callers only read the bundle: Mach-O images are cloned before
+	// relocation. The lock also lets concurrent first loads share one
+	// download.
+	loaded.mu.Lock()
+	defer loaded.mu.Unlock()
+
+	if loaded.directory == directory {
+		return loaded.bundle, nil
 	}
 
-	bundle, err := resolveRemoteImage(ctx)
+	bundle, err := readCache(directory)
 	if err != nil {
-		return Bundle{}, err
+		bundle, err = resolveRemoteImage(ctx)
+		if err != nil {
+			return Bundle{}, err
+		}
+
+		if err := writeCache(directory, bundle); err != nil {
+			return Bundle{}, fmt.Errorf("cache Apple SAP assets: %w", err)
+		}
 	}
 
-	if err := writeCache(directory, bundle); err != nil {
-		return Bundle{}, fmt.Errorf("cache Apple SAP assets: %w", err)
-	}
+	loaded.directory, loaded.bundle = directory, bundle
 
 	return bundle, nil
+}
+
+// loaded is the bundle Load last returned, for the cache directory it came
+// from.
+var loaded struct {
+	mu        sync.Mutex
+	directory string
+	bundle    Bundle
 }
 
 func cacheDirectory() (string, error) {
